@@ -1,5 +1,8 @@
-PREFIX  := quay.io/roboll/etcd-metrics-proxy
-VERSION := $(shell git describe --tags --abbrev=0 HEAD)
+ORG=openinsight-proj
+PROJECT=etcd-metrics-proxy
+REG=quay.io
+TAG=0.6.0
+PKG=github.com/openinsight-proj/etcd-metrics-proxy
 
 check:
 	go vet .
@@ -13,10 +16,15 @@ build:
 	GOOS=linux go build -a --ldflags '-extldflags "-static"' -tags netgo -installsuffix netgo -o etcd-metrics-proxy .
 .PHONY: build
 
-container: build
-	docker build -t $(PREFIX):$(VERSION) .
-.PHONY: container
+.PHONY: image/build
+image/build: build
+	docker build -t ${REG}/${ORG}/${PROJECT}:${TAG} .
 
-push: container
-	docker push $(PREFIX):$(VERSION)
-.PHONY: push
+# Build and push a multi-architecture docker image
+.PHONY: image/buildx
+image/buildx: build
+	docker buildx build --platform linux/amd64,linux/arm64,linux/s390x,linux/ppc64le --push -t ${REG}/${ORG}/${PROJECT}:${TAG} .
+
+.PHONY: image/push
+image/push:
+	docker push ${REG}/${ORG}/${PROJECT}:${TAG}
