@@ -4,6 +4,9 @@ REG=quay.io
 TAG=0.6.0
 PKG=github.com/openinsight-proj/etcd-metrics-proxy
 
+GOARCH ?= $(shell go env GOARCH)
+BUILD_ARCH ?= linux/$(GOARCH)
+
 check:
 	go vet .
 .PHONY: check
@@ -13,7 +16,7 @@ test:
 .PHONY: test
 
 build:
-	GOOS=linux go build -a --ldflags '-extldflags "-static"' -tags netgo -installsuffix netgo -o etcd-metrics-proxy .
+	GOOS=linux GOARCH=${GOARCH} go build -a --ldflags '-extldflags "-static"' -tags netgo -installsuffix netgo -o etcd-metrics-proxy .
 .PHONY: build
 
 .PHONY: image/build
