@@ -5,11 +5,11 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 )
 
 type config struct {
@@ -50,31 +50,48 @@ func main() {
 	flag.Parse()
 	validateFlags(&c)
 
-	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
-		Scheme: "https",
-		Host:   fmt.Sprintf("%s:%d", c.upstreamHost, c.upstreamPort),
-	})
+	var tryHttp bool
 
 	pool := x509.NewCertPool()
-	capem, err := ioutil.ReadFile(c.etcdCA)
+	capem, err := os.ReadFile(c.etcdCA)
 	if err != nil {
-		log.Fatal(err)
-	}
-	if !pool.AppendCertsFromPEM(capem) {
-		log.Fatal("error: failed to add ca to cert pool")
+		log.Println(err)
+		tryHttp = true
 	}
 
-	cert, err := tls.LoadX509KeyPair(c.etcdCert, c.etcdKey)
-	if err != nil {
-		log.Fatal(err)
+	var scheme string
+	var host string
+	if tryHttp {
+		scheme = "http"
+		host = fmt.Sprintf("%s:%d", c.upstreamHost, c.port)
+	} else {
+		scheme = "https"
+		host = fmt.Sprintf("%s:%d", c.upstreamHost, c.upstreamPort)
 	}
 
-	proxy.Transport = &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs:      pool,
-			Certificates: []tls.Certificate{cert},
-			ServerName:   c.upstreamServerName,
-		},
+	log.Printf("will proxy: %s://%s", scheme, host)
+	proxy := httputil.NewSingleHostReverseProxy(&url.URL{
+		Scheme: scheme,
+		Host:   host,
+	})
+
+	if !tryHttp {
+		if !pool.AppendCertsFromPEM(capem) {
+			log.Fatal("error: failed to add ca to cert pool")
+		}
+
+		cert, err := tls.LoadX509KeyPair(c.etcdCert, c.etcdKey)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		proxy.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      pool,
+				Certificates: []tls.Certificate{cert},
+				ServerName:   c.upstreamServerName,
+			},
+		}
 	}
 
 	director := proxy.Director
@@ -85,6 +102,9 @@ func main() {
 
 	server := http.NewServeMux()
 	server.Handle("/metrics", proxy)
+	server.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	})
 
 	addr := fmt.Sprintf(":%d", c.port)
 	log.Printf("server: listening on %s\n", addr)

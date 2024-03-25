@@ -6,6 +6,6 @@ RUN make build
 # RUN make insight-linux
 
 FROM alpine:3.15
-COPY --from=build /app/etcd-metrics-proxy  /
+COPY --from=builder /build/etcd-metrics-proxy  /
 ENTRYPOINT [ "/etcd-metrics-proxy" ]
 EXPOSE 2381 2381
