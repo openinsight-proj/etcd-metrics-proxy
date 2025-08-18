@@ -15,7 +15,11 @@ test:
 	go test -v . -cover -race -p=1
 .PHONY: test
 
-build:
+tidy:
+	go mod tidy
+.PHONY: tidy
+
+build: tidy
 	GOOS=linux GOARCH=${GOARCH} go build -a --ldflags '-extldflags "-static"' -tags netgo -installsuffix netgo -o etcd-metrics-proxy .
 .PHONY: build
 
