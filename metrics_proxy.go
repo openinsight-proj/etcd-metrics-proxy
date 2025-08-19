@@ -10,6 +10,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sync/atomic"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 type config struct {
@@ -80,18 +85,16 @@ func main() {
 			log.Fatal("error: failed to add ca to cert pool")
 		}
 
-		cert, err := tls.LoadX509KeyPair(c.etcdCert, c.etcdKey)
+		initialTransport, err := buildHTTPSTransport(pool, c.etcdCert, c.etcdKey, c.upstreamServerName)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		proxy.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{
-				RootCAs:      pool,
-				Certificates: []tls.Certificate{cert},
-				ServerName:   c.upstreamServerName,
-			},
-		}
+		switcher := &transportSwitcher{}
+		switcher.Store(initialTransport)
+		proxy.Transport = switcher
+
+		go watchAndReloadTLS(c, switcher)
 	}
 
 	director := proxy.Director
@@ -111,4 +114,144 @@ func main() {
 	if err := http.ListenAndServe(addr, server); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// transportSwitcher implements http.RoundTripper and atomically swaps the underlying *http.Transport.
+type transportSwitcher struct {
+	v atomic.Value // holds *http.Transport
+}
+
+func (s *transportSwitcher) RoundTrip(r *http.Request) (*http.Response, error) {
+	t, _ := s.v.Load().(*http.Transport)
+	if t == nil {
+		return http.DefaultTransport.RoundTrip(r)
+	}
+	return t.RoundTrip(r)
+}
+
+func (s *transportSwitcher) Store(t *http.Transport) {
+	s.v.Store(t)
+}
+
+// buildHTTPSTransport creates a new *http.Transport with the given cert pool and client cert/key.
+func buildHTTPSTransport(rootPool *x509.CertPool, certPath, keyPath, serverName string) (*http.Transport, error) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConf := &tls.Config{
+		RootCAs:      rootPool,
+		Certificates: []tls.Certificate{cert},
+		ServerName:   serverName,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	return &http.Transport{
+		TLSClientConfig:       tlsConf,
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}, nil
+}
+
+// watchAndReloadTLS watches etcd-ca, etcd-cert, and etcd-key for changes and rebuilds the transport.
+func watchAndReloadTLS(c config, switcher *transportSwitcher) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Printf("tls-reload: failed to create watcher: %v", err)
+		return
+	}
+	defer watcher.Close()
+
+	// Deduplicate directories to watch
+	targets := []string{c.etcdCA, c.etcdCert, c.etcdKey}
+	dirSet := map[string]struct{}{}
+	baseByDir := map[string]map[string]struct{}{}
+	for _, p := range targets {
+		dir := filepath.Dir(p)
+		base := filepath.Base(p)
+		dirSet[dir] = struct{}{}
+		if baseByDir[dir] == nil {
+			baseByDir[dir] = map[string]struct{}{}
+		}
+		baseByDir[dir][base] = struct{}{}
+	}
+
+	for dir := range dirSet {
+		if err := watcher.Add(dir); err != nil {
+			log.Printf("tls-reload: failed to watch dir %s: %v", dir, err)
+		} else {
+			log.Printf("tls-reload: watching %s", dir)
+		}
+	}
+
+	// Debounce timer to avoid excessive reloads during atomic updates (e.g., symlink swaps)
+	var reloadTimer *time.Timer
+	scheduleReload := func() {
+		if reloadTimer != nil {
+			reloadTimer.Stop()
+		}
+		reloadTimer = time.AfterFunc(250*time.Millisecond, func() {
+			performReload(c, switcher)
+		})
+	}
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			// Only react to changes for our target basenames in watched dirs
+			dir := filepath.Dir(event.Name)
+			base := filepath.Base(event.Name)
+			if m, exists := baseByDir[dir]; exists {
+				if _, target := m[base]; target {
+					switch event.Op {
+					case fsnotify.Create, fsnotify.Write, fsnotify.Remove, fsnotify.Rename, fsnotify.Chmod:
+						log.Printf("tls-reload: detected change: %s (%s)", event.Name, event.Op)
+						scheduleReload()
+					}
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("tls-reload: watcher error: %v", err)
+		}
+	}
+}
+
+func performReload(c config, switcher *transportSwitcher) {
+	// Rebuild root pool
+	capem, err := os.ReadFile(c.etcdCA)
+	if err != nil {
+		log.Printf("tls-reload: read ca failed: %v", err)
+		return
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(capem) {
+		log.Printf("tls-reload: failed to add ca to cert pool")
+		return
+	}
+
+	// Build new transport
+	newTransport, err := buildHTTPSTransport(pool, c.etcdCert, c.etcdKey, c.upstreamServerName)
+	if err != nil {
+		log.Printf("tls-reload: rebuild transport failed: %v", err)
+		return
+	}
+
+	// Close idle connections on the old transport before swap
+	if old, _ := switcher.v.Load().(*http.Transport); old != nil {
+		old.CloseIdleConnections()
+	}
+
+	switcher.Store(newTransport)
+	log.Printf("tls-reload: TLS configuration reloaded successfully")
 }
